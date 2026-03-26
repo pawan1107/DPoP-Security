@@ -4,6 +4,8 @@ import { cookies } from "next/headers";
 import { SignJWT, exportJWK, importJWK, JWK } from "jose";
 import { encrypt, decrypt } from "./lib/session";
 
+const API_URL = process.env.API_URL || "http://localhost:5083";
+
 // Define a simple key pair generator using Node.js Web Crypto API
 async function getOrCreateKeyPair(): Promise<{
   privateKey: CryptoKey | Uint8Array;
@@ -107,7 +109,7 @@ export async function loginAction() {
   cookieStore.delete("dpop_token");
   cookieStore.delete("dpop_key");
 
-  const url = "http://localhost:5083/api/auth/login";
+  const url = `${API_URL}/api/auth/login`;
 
   try {
     // backendFetch automatically generates the correct DPoP proof
@@ -156,7 +158,7 @@ export async function fetchDataAction() {
     // Decrypt the cookie value using the server's secret
     const accessToken = await decrypt(encryptedToken);
 
-    const url = "http://localhost:5083/weatherforecast";
+    const url = `${API_URL}/weatherforecast`;
     
     // backendFetch handles the DPoP proof generation seamlessly
     const res = await backendFetch(url, {
@@ -182,7 +184,7 @@ export async function fetchDataAction() {
 }
 
 export async function fetchPublicDataAction() {
-  const url = "http://localhost:5083/public-weather";
+  const url = `${API_URL}/public-weather`;
 
   try {
     // Calling backendFetch automatically ensures this device has a keypair 
