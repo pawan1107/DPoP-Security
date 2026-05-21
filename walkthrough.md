@@ -1,6 +1,6 @@
 # DPoP Architecture — Code Walkthrough
 
-This document breaks down the exact code implementations that make the DPoP and BFF architecture possible. 
+This document breaks down the exact code implementations that make the Hardware-Bound DPoP and BFF architecture possible. 
 
 ---
 
@@ -8,18 +8,21 @@ This document breaks down the exact code implementations that make the DPoP and 
 
 ![DPoP Architecture Overview](./dpop_architecture.png)
 
-Below is the complete sequence of how Next.js handles cryptographic logic so the browser doesn't have to.
+Below is the complete sequence of how the Browser natively generates proofs and Next.js acts as the BFF.
 
 ```mermaid
 sequenceDiagram
     participant Browser as Browser (page.tsx)
+    participant Crypto as Web Crypto API
     participant BFF as Next.js Server (actions.ts)
     participant API as .NET 8 API
 
     Note over Browser, API: Scenario A: Without Login (Anonymous Tracker)
-    Browser->>BFF: fetchPublicDataAction()
-    BFF->>BFF: getOrCreateKeyPair() -> generates dpop_key cookie
-    BFF->>BFF: createProof() -> generates DPoP mathematically signed header
+    Browser->>Crypto: getOrCreateClientKey() -> (extractable: false)
+    Crypto-->>Browser: CryptoKey
+    Browser->>Crypto: createClientProof() -> signs URL
+    Crypto-->>Browser: <proof>
+    Browser->>BFF: fetchPublicDataAction(<proof>)
     BFF->>API: GET /public-weather + DPoP: <proof>
     API->>API: DPoPMiddleware validates signature
     API->>API: Extracts JWK Thumbprint (Device_ID)
@@ -27,9 +30,9 @@ sequenceDiagram
     BFF-->>Browser: { success: true, data: [...] }
 
     Note over Browser, API: Scenario B: With Login (Authenticated)
-    Browser->>BFF: loginAction()
-    BFF->>BFF: Re-uses existing dpop_key cookie
-    BFF->>BFF: createProof() -> generates POST DPoP Header
+    Browser->>Crypto: createClientProof() -> signs POST URL
+    Crypto-->>Browser: <proof>
+    Browser->>BFF: loginAction(<proof>)
     BFF->>API: POST /api/auth/login + DPoP: <proof>
     API->>API: Validates credentials & DPoP signature
     API->>API: Computes Thumbprint, issues JWT with cnf.jkt = Thumbprint
@@ -38,9 +41,10 @@ sequenceDiagram
     BFF-->>Browser: { success: true }
 
     Note over Browser, API: Scenario C: Fetching Private Data
-    Browser->>BFF: fetchDataAction()
-    BFF->>BFF: Decrypts dpop_token & dpop_key cookies
-    BFF->>BFF: createProof() -> generates GET DPoP Header
+    Browser->>Crypto: createClientProof() -> signs GET URL
+    Crypto-->>Browser: <proof>
+    Browser->>BFF: fetchDataAction(<proof>)
+    BFF->>BFF: Decrypts dpop_token cookie
     BFF->>API: GET /weatherforecast + Authorization: DPoP <token> + DPoP: <proof>
     API->>API: JWT Middleware validates standard token
     API->>API: DPoPMiddleware forces proof thumbprint == cnf.jkt claim!
@@ -50,22 +54,21 @@ sequenceDiagram
 
 ---
 
-## 💻 1. The Frontend (Next.js BFF)
+## 💻 1. The Frontend (Hardware-Bound DPoP)
 
-All heavy lifting occurs specifically within Server Actions in the Next.js `frontend`.
+All cryptographic heavy lifting occurs specifically within the browser using `client-crypto.ts`.
 
-### `actions.ts` — The Central Security Hub
+### `client-crypto.ts` — The Browser's Secure Enclave
+*   **`getOrCreateClientKey()`**: Uses the browser's native `window.crypto.subtle.generateKey` to create an ECDSA P-256 keypair. Crucially, it sets `extractable: false`. This means the private key physically cannot leave the browser, not even by the user copying it! The key is stored in the browser's local `IndexedDB`.
+*   **`createClientProof()`**: Creates the actual `DPoP` JWT signature header. It injects the HTTP method (`htm`) and the URL (`htu`), appending a timestamp (`iat`) and a unique ID (`jti`), and signs it using the non-extractable private key.
+
+### `actions.ts` — The Next.js BFF
 This file forces all external API calls to wrap through `backendFetch()`.
-
-*   **`getOrCreateKeyPair()`**: Checks the `dpop_key` cookie. If it does not exist, it uses Node's Web Crypto API `crypto.subtle.generateKey` to mint a P-256 curve ECDSA Keypair. It encrypts the private key and stores it as an `HttpOnly` cookie.
-*   **`createProof()`**: Creates the actual `DPoP` JWT signature header. It injects the HTTP method (`htm`) and the URL (`htu`), appending a timestamp (`iat`) and a unique ID (`jti`) to prevent hackers from recording and replaying the same proof later.
-*   **`backendFetch()`**: The holy grail of our pattern. It wraps the standard `fetch()` command to automatically snag the device's Private Key, generate a `createProof()`, and staple the `DPoP` header to whatever outbound request is being made.
-
-### `lib/session.ts` — Iron Session
-Tokens and Private Keys are never sent raw. We use `iron-session` and the `COOKIE_SECRET` environment variable to wrap the data in AES-256-GCM encryption. Even if intercepting network traffic, these cookies appear as random garbage strings (`Fe26.2*...`).
+*   **`backendFetch()`**: The holy grail of our pattern. It accepts the `clientProof` from the React frontend, attaches the `DPoP` header, and forwards the request to the `.NET` backend.
+*   **The Access Token**: The Next.js server still encrypts the `.NET` Access Token and stores it in an `HttpOnly` cookie. This completely prevents Cross-Site Scripting (XSS) from stealing the Access Token.
 
 ### `page.tsx` — The UI
-The entire React UI is completely oblivious to the security operations. It calls functions like `fetchDataAction()` with zero parameters. Because everything is handled server-side, it is mathematically impossible for an XSS attack to steal tokens or keys from the browser UI.
+The React UI calls `createClientProof()` before triggering any Server Actions. By keeping the private key locked in the browser, but the Access Token locked in the Next.js server, we combine the best of both security models.
 
 ---
 

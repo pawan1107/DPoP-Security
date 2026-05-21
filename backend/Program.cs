@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 using Backend.Middleware;
+using Backend.GraphQL;
 using System.Text;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -9,6 +10,13 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 builder.Services.AddControllers();
+builder.Services.AddHttpContextAccessor();
+
+builder.Services
+    .AddGraphQLServer()
+    .AddAuthorization()
+    .AddQueryType<Query>()
+    .AddMutationType<Mutation>();
 
 builder.Services.AddCors(options =>
 {
@@ -68,58 +76,6 @@ app.UseAuthorization();
 app.UseDPoPValidation(); // Custom middleware
 
 app.MapControllers();
-
-var summaries = new[]
-{
-    "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
-};
-
-// Protect the endpoint with RequireAuthorization
-app.MapGet("/weatherforecast", (HttpContext context) =>
-{
-    var forecast =  Enumerable.Range(1, 5).Select(index =>
-        new WeatherForecast
-        (
-            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-            Random.Shared.Next(-20, 55),
-            summaries[Random.Shared.Next(summaries.Length)]
-        ))
-        .ToArray();
-    return new {
-        Data = forecast,
-        Device_ID = context.Items["DPoP_Thumbprint"] ?? "No DPoP Key",
-        DPoP_Valid = context.Items["DPoP_Valid"] ?? false,
-        DPoP_Error = context.Items["DPoP_Error"]
-    };
-})
-.WithName("GetWeatherForecast")
-.RequireAuthorization()
-.WithOpenApi();
-
-// Public endpoint without RequireAuthorization to test device tracking DPoP
-app.MapGet("/public-weather", (HttpContext context) =>
-{
-    var forecast =  Enumerable.Range(1, 5).Select(index =>
-        new WeatherForecast
-        (
-            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-            Random.Shared.Next(-20, 55),
-            summaries[Random.Shared.Next(summaries.Length)]
-        ))
-        .ToArray();
-    return new {
-        Data = forecast,
-        Device_ID = context.Items["DPoP_Thumbprint"] ?? "No DPoP Key",
-        DPoP_Valid = context.Items["DPoP_Valid"] ?? false,
-        DPoP_Error = context.Items["DPoP_Error"]
-    };
-})
-.WithName("GetPublicWeather")
-.WithOpenApi();
+app.MapGraphQL();
 
 app.Run();
-
-record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
-{
-    public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
-}

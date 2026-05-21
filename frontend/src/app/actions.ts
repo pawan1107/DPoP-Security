@@ -1,101 +1,18 @@
 "use server";
 
 import { cookies } from "next/headers";
-import { SignJWT, exportJWK, importJWK, JWK } from "jose";
 import { encrypt, decrypt } from "./lib/session";
 
 const API_URL = process.env.API_URL || "http://localhost:5083";
 
-// Define a simple key pair generator using Node.js Web Crypto API
-async function getOrCreateKeyPair(): Promise<{
-  privateKey: CryptoKey | Uint8Array;
-  jwk: JWK;
-}> {
-  const cookieStore = await cookies();
-  const existingKeyStr = cookieStore.get("dpop_key")?.value;
-
-  if (existingKeyStr) {
-    try {
-      const decryptedKey = await decrypt(existingKeyStr);
-      const jwk = JSON.parse(decryptedKey) as JWK;
-      // We must specify the parameters for ECDSA P-256 for importJWK
-      const privateKey = await importJWK(jwk, "ES256");
-      return { privateKey, jwk };
-    } catch {
-      // Fallback to regenerate
-    }
-  }
-
-  // Generate new
-  const keyPair = await crypto.subtle.generateKey(
-    { name: "ECDSA", namedCurve: "P-256" },
-    true,
-    ["sign", "verify"],
-  );
-
-  const jwk = await exportJWK(keyPair.privateKey); // export private key for storage!
-  // Encrypt the private key before storing in a cookie — even if copied, it's
-  // useless without the server's COOKIE_SECRET.
-  const encryptedKey = await encrypt(JSON.stringify(jwk));
-  cookieStore.set("dpop_key", encryptedKey, {
-    httpOnly: true,
-    secure: true,
-    sameSite: "strict",
-    path: "/",
-  });
-
-  return {
-    privateKey: keyPair.privateKey,
-    jwk: await exportJWK(keyPair.publicKey),
-  };
-}
-
-// Generate DPoP proof on the server
-async function createProof(
-  privateKey: CryptoKey | Uint8Array,
-  publicKeyJwk: JWK,
-  method: string,
-  url: string,
-): Promise<string> {
-  const jti = crypto.randomUUID();
-  const iat = Math.floor(Date.now() / 1000);
-
-  // We only transmit the public part in the proof header
-  const publicJwk = {
-    crv: publicKeyJwk.crv,
-    kty: publicKeyJwk.kty,
-    x: publicKeyJwk.x,
-    y: publicKeyJwk.y,
-  };
-
-  const proof = await new SignJWT({
-    jti: jti,
-    htm: method,
-    htu: url,
-  })
-    .setProtectedHeader({ alg: "ES256", typ: "dpop+jwt", jwk: publicJwk })
-    .setIssuedAt(iat)
-    .sign(privateKey as CryptoKey | Uint8Array);
-
-  return proof;
-}
-
 /**
- * A wrapper around `fetch` that automatically generates and attaches a short-lived
- * DPoP proof for the specific URL and Method being requested. This ensures that EVERY 
- * request to the backend is cryptographically tracked to this specific device,
- * regardless of whether the user is logged in or not.
+ * A wrapper around `fetch` that attaches the short-lived DPoP proof
+ * generated securely by the browser's hardware.
  */
-async function backendFetch(url: string, options: RequestInit = {}) {
-  // Always get or create the device keypair
-  const { privateKey, jwk } = await getOrCreateKeyPair();
-  const publicJwk = { crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y };
-  
-  const method = (options.method || "GET").toUpperCase();
-  const proof = await createProof(privateKey, publicJwk, method, url);
-
+async function backendFetch(url: string, options: RequestInit = {}, clientProof: string) {
   const headers = new Headers(options.headers || {});
-  headers.set("DPoP", proof);
+  headers.set("DPoP", clientProof);
+  headers.set("Content-Type", "application/json");
 
   return fetch(url, {
     ...options,
@@ -103,29 +20,50 @@ async function backendFetch(url: string, options: RequestInit = {}) {
   });
 }
 
-export async function loginAction() {
+export async function loginAction(clientProof: string) {
   const cookieStore = await cookies();
   // Clear any old session
   cookieStore.delete("dpop_token");
-  cookieStore.delete("dpop_key");
 
-  const url = `${API_URL}/api/auth/login`;
+  const url = `${API_URL}/graphql`;
+  const body = JSON.stringify({
+    query: `
+      mutation {
+        login {
+          accessToken
+          tokenType
+          expiresIn
+          error
+        }
+      }
+    `
+  });
 
   try {
-    // backendFetch automatically generates the correct DPoP proof
+    // Pass the client's proof to the backend
     const res = await backendFetch(url, {
       method: "POST",
+      body,
       cache: "no-store",
-    });
+    }, clientProof);
 
     if (!res.ok) {
       return { success: false, error: `${res.status} ${await res.text()}` };
     }
 
-    const data = await res.json();
+    const json = await res.json();
+    
+    if (json.errors) {
+       return { success: false, error: json.errors[0].message };
+    }
+    
+    const data = json.data.login;
+    if (data.error) {
+       return { success: false, error: data.error };
+    }
 
     // Encrypt and store access token in HttpOnly cookie
-    const encryptedToken = await encrypt(data.access_token);
+    const encryptedToken = await encrypt(data.accessToken);
     cookieStore.set("dpop_token", encryptedToken, {
       httpOnly: true,
       secure: true,
@@ -136,7 +74,7 @@ export async function loginAction() {
     return {
       success: true,
       message:
-        "Server securely acquired DPoP Token and stored in HttpOnly cookie.",
+        "Server securely acquired Access Token and stored in HttpOnly cookie.",
     };
   } catch (error: unknown) {
     return {
@@ -146,7 +84,7 @@ export async function loginAction() {
   }
 }
 
-export async function fetchDataAction() {
+export async function fetchDataAction(clientProof: string) {
   const cookieStore = await cookies();
   const encryptedToken = cookieStore.get("dpop_token")?.value;
 
@@ -158,23 +96,44 @@ export async function fetchDataAction() {
     // Decrypt the cookie value using the server's secret
     const accessToken = await decrypt(encryptedToken);
 
-    const url = `${API_URL}/weatherforecast`;
+    const url = `${API_URL}/graphql`;
+    const body = JSON.stringify({
+      query: `
+        query {
+          weatherForecast {
+            data {
+              date
+              temperatureC
+              summary
+            }
+            device_ID
+            dPoP_Valid
+            dPoP_Error
+          }
+        }
+      `
+    });
     
-    // backendFetch handles the DPoP proof generation seamlessly
+    // Pass the client's proof for this specific GET request
     const res = await backendFetch(url, {
-      method: "GET",
+      method: "POST",
       headers: {
         Authorization: `DPoP ${accessToken}`,
       },
+      body,
       cache: "no-store",
-    });
+    }, clientProof);
 
     if (!res.ok) {
       return { success: false, error: `${res.status} ${await res.text()}` };
     }
 
-    const data = await res.json();
-    return { success: true, data };
+    const json = await res.json();
+    if (json.errors) {
+       return { success: false, error: json.errors[0].message };
+    }
+
+    return { success: true, data: json.data.weatherForecast };
   } catch (error: unknown) {
     return {
       success: false,
@@ -183,23 +142,83 @@ export async function fetchDataAction() {
   }
 }
 
-export async function fetchPublicDataAction() {
-  const url = `${API_URL}/public-weather`;
+export async function fetchPublicDataAction(clientProof: string) {
+  const url = `${API_URL}/graphql`;
+  const body = JSON.stringify({
+    query: `
+      query {
+        publicWeather {
+          data {
+            date
+            temperatureC
+            summary
+          }
+          device_ID
+          dPoP_Valid
+          dPoP_Error
+        }
+      }
+    `
+  });
 
   try {
-    // Calling backendFetch automatically ensures this device has a keypair 
-    // and sends an authenticated DPoP tracking header.
+    // Pass the client's proof to cryptographically track the device
     const res = await backendFetch(url, {
-      method: "GET",
+      method: "POST",
+      body,
       cache: "no-store",
-    });
+    }, clientProof);
 
     if (!res.ok) {
       return { success: false, error: `${res.status} ${await res.text()}` };
     }
 
-    const data = await res.json();
-    return { success: true, data };
+    const json = await res.json();
+    if (json.errors) {
+       return { success: false, error: json.errors[0].message };
+    }
+
+    return { success: true, data: json.data.publicWeather };
+  } catch (error: unknown) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+export async function fetchCustomPublicDataAction(clientProof: string, queryName: string) {
+  const url = `${API_URL}/graphql`;
+  const body = JSON.stringify({
+    query: `
+      query {
+        ${queryName} {
+          data
+          device_ID
+          dPoP_Valid
+          dPoP_Error
+        }
+      }
+    `
+  });
+
+  try {
+    const res = await backendFetch(url, {
+      method: "POST",
+      body,
+      cache: "no-store",
+    }, clientProof);
+
+    if (!res.ok) {
+      return { success: false, error: `${res.status} ${await res.text()}` };
+    }
+
+    const json = await res.json();
+    if (json.errors) {
+       return { success: false, error: json.errors[0].message };
+    }
+
+    return { success: true, data: json.data[queryName] };
   } catch (error: unknown) {
     return {
       success: false,
