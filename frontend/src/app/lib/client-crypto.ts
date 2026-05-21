@@ -1,4 +1,5 @@
 import { SignJWT, exportJWK, JWK } from "jose";
+import { instantBotCheck } from "./anti-bot";
 
 const DB_NAME = "DPoP_Store";
 const STORE_NAME = "keys";
@@ -42,6 +43,13 @@ export async function getOrCreateClientKey(): Promise<{
   privateKey: CryptoKey;
   publicJwk: JWK;
 }> {
+  // ⛔ GATE: Run instant bot checks BEFORE generating any cryptographic keys.
+  // If a bot is detected, refuse to create a device identity.
+  const botReasons = instantBotCheck();
+  if (botReasons.length > 0) {
+    throw new Error(`🚫 Bot detected (${botReasons.join(", ")}). Device key generation blocked.`);
+  }
+
   let keys = await getKeyPairFromDB();
 
   if (!keys) {

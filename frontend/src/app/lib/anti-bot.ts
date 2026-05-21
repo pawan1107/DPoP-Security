@@ -7,11 +7,142 @@ export type BotDetectionReason =
   | "MOUSE_BIOMETRICS_ANOMALY"
   | "EXECUTION_TIMING_ANOMALY"
   | "AUDIO_FINGERPRINT_ANOMALY"
-  | "WINDOW_GEOMETRY_ANOMALY";
+  | "WINDOW_GEOMETRY_ANOMALY"
+  | "CLICK_TIMING_ANOMALY"
+  | "MOUSE_TELEPORTATION_ANOMALY"
+  | "CDP_LEAK_DETECTED"
+  | "MISSING_CHROME_RUNTIME"
+  | "ZERO_PLUGINS"
+  | "PERMISSIONS_ANOMALY"
+  | "WEBDRIVER_DETECTED";
+
+/**
+ * Runs instant, synchronous checks that detect automation frameworks
+ * BEFORE any DPoP keys or device IDs are generated.
+ * Returns an array of reasons if a bot is detected, or empty array if clean.
+ */
+export function instantBotCheck(): BotDetectionReason[] {
+  const reasons: BotDetectionReason[] = [];
+
+  // 1. navigator.webdriver — Patchright patches this, but check anyway
+  if ((navigator as any).webdriver === true) {
+    reasons.push("WEBDRIVER_DETECTED");
+  }
+
+  // 2. CDP (Chrome DevTools Protocol) leak detection
+  try {
+    // Check document for cdc_ keys (ChromeDriver) and playwright internals
+    const docKeys = Object.keys(document);
+    const cdcLeak = docKeys.some(k => k.startsWith('cdc_') || k.startsWith('__playwright'));
+    if (cdcLeak) {
+      reasons.push("CDP_LEAK_DETECTED");
+    }
+    // Check window for automation framework globals
+    const winKeys = Object.getOwnPropertyNames(window);
+    const automationGlobals = winKeys.some(k =>
+      k.includes('__playwright') ||
+      k.includes('__puppeteer') ||
+      k.includes('__selenium') ||
+      k.includes('__webdriver') ||
+      k.includes('__nightmare') ||
+      k.includes('_phantom') ||
+      k.includes('callPhantom')
+    );
+    if (automationGlobals) {
+      reasons.push("CDP_LEAK_DETECTED");
+    }
+  } catch (e) { /* ignore */ }
+
+  // 3. DEEP Chrome Runtime Verification
+  //    The attacker can inject a fake window.chrome via addInitScript,
+  //    but those injected functions are plain JavaScript, NOT native C++ bindings.
+  //    Real Chrome's runtime functions return "[native code]" when toString'd.
+  //    Additionally, real web pages do NOT have chrome.runtime.id set — 
+  //    that property only exists inside Chrome extension contexts.
+  if (typeof (window as any).chrome !== 'undefined') {
+    const chrome = (window as any).chrome;
+    if (!chrome.runtime || Object.keys(chrome.runtime).length === 0) {
+      reasons.push("MISSING_CHROME_RUNTIME");
+    } else {
+      // Deep check: Verify native function signatures
+      // A real chrome.runtime.connect is a native C++ binding: "function connect() { [native code] }"
+      // An attacker's fake is: "function() {}" or "function connect() {}"
+      const functionsToVerify = ['connect', 'sendMessage', 'getURL', 'getManifest'];
+      for (const fn of functionsToVerify) {
+        if (typeof chrome.runtime[fn] === 'function') {
+          const fnStr = chrome.runtime[fn].toString();
+          if (!fnStr.includes('[native code]')) {
+            reasons.push("MISSING_CHROME_RUNTIME");
+            break;
+          }
+        }
+      }
+
+      // Deep check: chrome.runtime.id should NOT exist on a normal web page.
+      // It only exists inside extension contexts. If an attacker set a dummy id,
+      // that's a dead giveaway.
+      if (chrome.runtime.id !== undefined) {
+        reasons.push("MISSING_CHROME_RUNTIME");
+      }
+    }
+  } else {
+    if (navigator.userAgent.includes('Chrome')) {
+      reasons.push("MISSING_CHROME_RUNTIME");
+    }
+  }
+
+  // 4. Deep Plugin Verification
+  //    Attacker can spoof navigator.plugins.length, but real PluginArray items
+  //    are instances of the native Plugin class with proper prototypes.
+  //    Spoofed plugins injected via addInitScript are plain JS objects.
+  if (navigator.plugins) {
+    if (navigator.plugins.length === 0) {
+      reasons.push("ZERO_PLUGINS");
+    } else {
+      // Verify that at least one plugin has the native Plugin prototype
+      try {
+        const firstPlugin = navigator.plugins[0];
+        if (firstPlugin) {
+          // Real plugins have a native toString: "[object Plugin]"
+          const pluginStr = Object.prototype.toString.call(firstPlugin);
+          if (pluginStr !== '[object Plugin]') {
+            reasons.push("ZERO_PLUGINS");
+          }
+        }
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  // 5. Error stack trace analysis
+  //    Playwright/Patchright sometimes leaves traces in error stack origins.
+  //    Generate an error and inspect where the stack originates.
+  try {
+    const err = new Error('probe');
+    const stack = err.stack || '';
+    // Playwright's internal evaluate calls sometimes leak patchright/playwright paths
+    if (stack.includes('playwright') || stack.includes('patchright') || stack.includes('puppeteer')) {
+      reasons.push("CDP_LEAK_DETECTED");
+    }
+  } catch (e) { /* ignore */ }
+
+  // 6. Permissions API anomaly
+  try {
+    if (typeof Notification !== 'undefined' && Notification.permission === 'denied') {
+      navigator.permissions.query({ name: 'notifications' as PermissionName }).then(result => {
+        if (result.state === 'prompt') {
+          // Mismatch detected (async — won't block key gen, but will flag UI)
+        }
+      }).catch(() => {});
+    }
+  } catch (e) { /* ignore */ }
+
+  return reasons;
+}
 
 export class BotDetector {
   private onDetect: (reason: BotDetectionReason) => void;
   private lastKeydownTime: number = 0;
+  private lastMousedownTime: number = 0;
   private cleanupFunctions: (() => void)[] = [];
 
   // For mouse biometrics
@@ -19,15 +150,23 @@ export class BotDetector {
   private lastMouseY: number = -1;
   private lastMouseTime: number = 0;
   private constantVelocityCount: number = 0;
+  private pointerMoveCount: number = 0;
 
   constructor(onDetect: (reason: BotDetectionReason) => void) {
     this.onDetect = onDetect;
   }
 
   public start() {
-    this.checkConsolePatch(); // Disabled for Next.js dev mode (Next.js patches console internally)
+    // Run instant checks first
+    const instantReasons = instantBotCheck();
+    for (const reason of instantReasons) {
+      this.triggerDetection(reason);
+    }
+
+    // Then set up ongoing monitors
     this.monitorPointerEvents();
     this.monitorKeyboardEvents();
+    this.monitorClickEvents();
 
     // Advanced Heuristics
     this.checkWebGLMismatch();
@@ -64,6 +203,8 @@ export class BotDetector {
   // --- 2 & 7. Coalesced Events & Mouse Biometrics ---
   private monitorPointerEvents() {
     const handlePointerMove = (e: PointerEvent) => {
+      this.pointerMoveCount++;
+
       // Coalesced Check
       if (e.getCoalescedEvents && typeof e.getCoalescedEvents === 'function') {
         const funcStr = e.getCoalescedEvents.toString();
@@ -132,6 +273,56 @@ export class BotDetector {
     this.cleanupFunctions.push(() => {
       window.removeEventListener('keydown', handleKeydown);
       window.removeEventListener('input', handleInput, { capture: true });
+    });
+  }
+
+  // --- 3.5. Click Timing & Teleportation Anomalies ---
+  private monitorClickEvents() {
+    const handlePointerdown = (e: PointerEvent) => {
+      // Ignore touch screens and pens
+      if (e.pointerType !== "mouse") return;
+      
+      this.lastMousedownTime = performance.now();
+
+      // Teleportation Check 1: No previous pointer moves
+      if (this.lastMouseX === -1) {
+         this.triggerDetection("MOUSE_TELEPORTATION_ANOMALY");
+      } else {
+         const distance = Math.sqrt(
+           Math.pow(e.clientX - this.lastMouseX, 2) + 
+           Math.pow(e.clientY - this.lastMouseY, 2)
+         );
+         // Teleportation Check 2: Jumped > 15 pixels instantly
+         if (distance > 15) {
+            this.triggerDetection("MOUSE_TELEPORTATION_ANOMALY");
+         }
+      }
+
+      // Teleportation Check 3: Playwright bypasses Checks 1 & 2 by firing exactly ONE 
+      // pointermove event directly on the target coordinate right before clicking.
+      // A human generates dozens of pointermove events just dragging the mouse.
+      if (this.pointerMoveCount < 5) {
+         this.triggerDetection("MOUSE_TELEPORTATION_ANOMALY");
+      }
+    };
+
+    const handlePointerup = (e: PointerEvent) => {
+      if (e.pointerType !== "mouse") return;
+      const timeSinceDown = performance.now() - this.lastMousedownTime;
+      // Real humans physically cannot click and release a physical mouse button in less than 5ms.
+      // Automation tools (like Playwright's default click) often dispatch these instantly (0-2ms).
+      if (this.lastMousedownTime > 0 && timeSinceDown < 5) {
+        this.triggerDetection("CLICK_TIMING_ANOMALY");
+      }
+    };
+
+    // Use pointerdown/up instead of mousedown/up to properly detect the hardware type (touch vs mouse)
+    window.addEventListener('pointerdown', handlePointerdown, { passive: true });
+    window.addEventListener('pointerup', handlePointerup, { passive: true });
+
+    this.cleanupFunctions.push(() => {
+      window.removeEventListener('pointerdown', handlePointerdown);
+      window.removeEventListener('pointerup', handlePointerup);
     });
   }
 
