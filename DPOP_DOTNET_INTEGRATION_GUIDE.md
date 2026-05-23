@@ -73,6 +73,21 @@ if (DateTimeOffset.UtcNow - issuedAt > TimeSpan.FromSeconds(60))
 }
 ```
 
+**4. Extract Covert Bot Detection Signal:**
+
+The frontend silently embeds a bot detection score inside every DPoP JWT. The claim names are intentionally innocuous so bot operators won't recognize them:
+*   `_v` = Bot score (0 = clean human, higher = more suspicious)
+*   `_c` = Comma-separated detection reason codes (e.g., `"CDP_LEAK_DETECTED,ZERO_PLUGINS"`)
+
+Since the JWT is signed by the client's private key, a bot **cannot tamper** with these values after signing.
+
+```csharp
+var botScore = int.Parse(token.Claims.FirstOrDefault(c => c.Type == "_v")?.Value ?? "0");
+var botFlags = token.Claims.FirstOrDefault(c => c.Type == "_c")?.Value ?? "";
+
+// If botScore > 0, the frontend's anti-bot system detected anomalies on this device
+```
+
 ---
 
 ## 3. Database Schema: Known Devices
@@ -82,6 +97,8 @@ The DPoP Thumbprint (`jkt`) natively acts as a cryptographically secure, unforge
 ```sql
 CREATE TABLE KnownDevices (
     DeviceThumbprint VARCHAR(255) PRIMARY KEY, -- The DPoP jkt hash
+    BotScore INT DEFAULT 0,                    -- Covert bot signal from frontend (0 = clean)
+    BotFlags VARCHAR(500),                     -- Detection reason codes
     FirstSeenAt DATETIME DEFAULT GETDATE(),
     LastSeenAt DATETIME
 );

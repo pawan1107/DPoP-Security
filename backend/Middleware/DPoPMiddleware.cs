@@ -67,6 +67,14 @@ public class DPoPMiddleware
                         var htu = token.Claims.FirstOrDefault(c => c.Type == "htu")?.Value;
                         var currentUrl = $"{context.Request.Scheme}://{context.Request.Host}{context.Request.PathBase}{context.Request.Path}";
 
+                        // Extract covert bot detection signal from the signed JWT.
+                        // The frontend embeds these silently — the bot cannot tamper with them
+                        // because they are inside the cryptographically signed payload.
+                        var botScore = token.Claims.FirstOrDefault(c => c.Type == "_v")?.Value ?? "0";
+                        var botFlags = token.Claims.FirstOrDefault(c => c.Type == "_c")?.Value ?? "";
+                        context.Items["DPoP_BotScore"] = int.TryParse(botScore, out var score) ? score : 0;
+                        context.Items["DPoP_BotFlags"] = botFlags;
+
                         if (!string.Equals(htm, context.Request.Method, StringComparison.OrdinalIgnoreCase))
                         {
                             dpopError = "DPoP htm mismatch.";

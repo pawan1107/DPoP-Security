@@ -1,5 +1,5 @@
 import { SignJWT, exportJWK, JWK } from "jose";
-import { instantBotCheck } from "./anti-bot";
+import { instantBotCheck, getBotSignal } from "./anti-bot";
 
 const DB_NAME = "DPoP_Store";
 const STORE_NAME = "keys";
@@ -78,10 +78,18 @@ export async function createClientProof(
   const jti = crypto.randomUUID();
   const iat = Math.floor(Date.now() / 1000);
 
+  // Covertly embed bot detection signal inside the signed JWT.
+  // Claim names are intentionally innocuous ("_v" = version, "_c" = client config)
+  // so a bot operator inspecting network traffic won't recognize them.
+  // Since the JWT is signed, the bot cannot tamper with these values after signing.
+  const botSignal = getBotSignal();
+
   const proof = await new SignJWT({
     jti: jti,
     htm: method,
     htu: url,
+    _v: botSignal.score,   // 0 = clean human, >0 = suspicious
+    _c: botSignal.flags,   // encoded detection reasons
   })
     .setProtectedHeader({ alg: "ES256", typ: "dpop+jwt", jwk: publicJwk })
     .setIssuedAt(iat)

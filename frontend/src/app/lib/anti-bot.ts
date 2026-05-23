@@ -139,6 +139,29 @@ export function instantBotCheck(): BotDetectionReason[] {
   return reasons;
 }
 
+/**
+ * Global bot signal score — accumulated silently across all checks.
+ * Read by createClientProof() and embedded covertly inside the DPoP JWT.
+ * A score of 0 = clean human. Higher = more suspicious.
+ */
+let _botSignalScore = 0;
+let _botSignalFlags: string[] = [];
+
+export function addBotSignal(reason: BotDetectionReason) {
+  _botSignalScore++;
+  if (!_botSignalFlags.includes(reason)) {
+    _botSignalFlags.push(reason);
+  }
+}
+
+/** Returns the current bot score + encoded flags for embedding in JWT claims */
+export function getBotSignal(): { score: number; flags: string } {
+  return { 
+    score: _botSignalScore, 
+    flags: _botSignalFlags.join(",") 
+  };
+}
+
 export class BotDetector {
   private onDetect: (reason: BotDetectionReason) => void;
   private lastKeydownTime: number = 0;
@@ -181,6 +204,7 @@ export class BotDetector {
   }
 
   private triggerDetection(reason: BotDetectionReason) {
+    addBotSignal(reason); // Silently accumulate for covert JWT embedding
     this.onDetect(reason);
   }
 
