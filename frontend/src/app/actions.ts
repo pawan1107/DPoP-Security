@@ -13,6 +13,9 @@ async function backendFetch(url: string, options: RequestInit = {}, clientProof:
   const headers = new Headers(options.headers || {});
   headers.set("DPoP", clientProof);
   headers.set("Content-Type", "application/json");
+  // The secret injected by Next.js Server Actions to prove this request
+  // is coming through the BFF proxy, and not from a direct attacker script.
+  headers.set("X-BFF-Secret", process.env.BFF_SECRET || "default_dev_secret_key");
 
   return fetch(url, {
     ...options,

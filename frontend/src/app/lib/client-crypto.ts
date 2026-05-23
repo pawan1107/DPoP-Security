@@ -69,6 +69,26 @@ export async function getOrCreateClientKey(): Promise<{
   return { privateKey: keys.privateKey, publicJwk };
 }
 
+async function generateProofOfWork(difficulty: number = 3): Promise<{ nonce: number; hash: string }> {
+  // A simple Hashcash-style PoW. We find a nonce such that SHA-256(timestamp + nonce)
+  // starts with `difficulty` number of zeros.
+  const prefix = "0".repeat(difficulty);
+  const timestamp = Date.now().toString();
+  let nonce = 0;
+  
+  while (true) {
+    const data = new TextEncoder().encode(`${timestamp}:${nonce}`);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    
+    if (hashHex.startsWith(prefix)) {
+      return { nonce, hash: hashHex };
+    }
+    nonce++;
+  }
+}
+
 export async function createClientProof(
   method: string,
   url: string
@@ -84,12 +104,17 @@ export async function createClientProof(
   // Since the JWT is signed, the bot cannot tamper with these values after signing.
   const botSignal = getBotSignal();
 
+  // Generate a Proof of Work to burn botnet CPU cycles
+  // In a real app, you might only require PoW on device registration or login
+  const pow = await generateProofOfWork(3); // Require 3 leading zeros (takes ~1-50ms)
+
   const proof = await new SignJWT({
     jti: jti,
     htm: method,
     htu: url,
     _v: botSignal.score,   // 0 = clean human, >0 = suspicious
     _c: botSignal.flags,   // encoded detection reasons
+    _pow: pow.nonce,       // The valid nonce the bot had to spend CPU cycles to find
   })
     .setProtectedHeader({ alg: "ES256", typ: "dpop+jwt", jwk: publicJwk })
     .setIssuedAt(iat)

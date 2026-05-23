@@ -1,36 +1,39 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Next.js Secure Frontend with DPoP & Anti-Bot
+
+This Next.js application serves as the ultra-secure frontend for the `.NET` backend. It implements multiple layers of defense-in-depth to protect against automated bot attacks, session theft, and replay attacks.
+
+## Core Security Features
+
+### 1. DPoP (Demonstrating Proof-of-Possession)
+- Uses `IndexedDB` to securely store a non-extractable ECDSA Private Key.
+- Signs every request (using `jose`) with a short-lived JWT.
+- Protects against Token/Cookie theft because the private key cannot physically leave the user's browser.
+
+### 2. Client-Side Anti-Bot Heuristics
+- `anti-bot.ts` runs passive behavioral checks (mouse teleportation, CDP leaks, coalesced events).
+- The detection score is **covertly embedded** into the DPoP JWT payload (as `_v` and `_c` claims).
+- The bot is forced to cryptographically sign and send its own detection flags to the server without realizing it.
+
+### 3. Proof of Work (PoW)
+- Before registering a device, the browser must solve a SHA-256 Hashcash puzzle (mining a nonce that produces a hash starting with "000").
+- This requires negligible CPU time for a real user, but economically bankrupts a botnet trying to generate 10,000 fake devices per second.
+
+### 4. Edge Middleware Rate Limiting
+- `middleware.ts` runs at the Next.js Edge (Vercel/Cloudflare).
+- Blocks IP addresses that make too many requests instantly, protecting the Node and .NET servers from DDoS or scraping.
+
+### 5. Backend-For-Frontend (BFF) Pattern
+- React components NEVER call the `.NET` API directly.
+- All requests go through Next.js **Server Actions** (`actions.ts`), which proxy the request to `.NET`.
+- Injects a secret `X-BFF-Secret` header so `.NET` can perfectly distinguish traffic coming through the secure proxy vs direct script attacks.
+
+### 6. Production Obfuscation & CSP
+- `webpack-obfuscator` automatically mangles `anti-bot.ts` and `client-crypto.ts` during `npm run build`, making it extremely difficult for attackers to reverse-engineer the bot detection.
+- Strict Content-Security-Policy (CSP) headers prevent malicious script injections.
 
 ## Getting Started
 
-First, run the development server:
-
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
-
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
